@@ -3,6 +3,7 @@ from os import path
 import warnings
 import numpy as np
 import torch
+import cv2
 import torch.nn.functional as F
 from torchvision.transforms import functional as TF, InterpolationMode
 import argparse
@@ -39,25 +40,20 @@ from .backward_warp import (
 from .stereo_model_factory import create_stereo_model
 from .inpaint_utils import INPAINT_MODELS
 
-
 ROW_FLOW_V2_MAX_DIVERGENCE = 2.5
 ROW_FLOW_V3_MAX_DIVERGENCE = 5.0
 ROW_FLOW_V2_AUTO_STEP_DIVERGENCE = 2.0
 ROW_FLOW_V3_AUTO_STEP_DIVERGENCE = 4.0
 IMAGE_IO_QUEUE_MAX = 100
 
-
 def chunks(array, n):
     for i in range(0, len(array), n):
         yield array[i:i + n]
 
-
 def to_pil_image(x):
-    # x is already clipped to 0-1
     assert x.dtype in {torch.float32, torch.float16}
     x = TF.to_pil_image((x * 255).round().to(torch.uint8).cpu())
     return x
-
 
 def apply_rgbd(im, depth, mapper):
     height, width = im.shape[-2:]
@@ -75,26 +71,19 @@ def apply_rgbd(im, depth, mapper):
     right_eye = right_eye.expand_as(left_eye)
     return left_eye, right_eye
 
-
-# Filename suffix for VR Player's video format detection
-# LRF: full left-right 3D video
 FULL_SBS_SUFFIX = "_LRF_Full_SBS"
 HALF_SBS_SUFFIX = "_LR"
 FULL_TB_SUFFIX = "_TBF_fulltb"
 HALF_TB_SUFFIX = "_TB"
 CROSS_EYED_SUFFIX = "_RLF_cross"
-RGBD_SUFFIX = "_RGBD"  # TODO
-HALF_RGBD_SUFFIX = "_HRGBD"  # TODO
+RGBD_SUFFIX = "_RGBD"
+HALF_RGBD_SUFFIX = "_HRGBD"
 
 VR180_SUFFIX = "_180x180_LR"
 ANAGLYPH_SUFFIX = "_redcyan"
 DEBUG_SUFFIX = "_debug"
 
-# SMB Invalid characters
-# Linux SMB replaces file names with random strings if they contain these invalid characters
-# So need to remove these for the filenaming rules.
 SMB_INVALID_CHARS = '\\/:*?"<>|'
-
 
 def make_output_filename(input_filename, args, video=False):
     basename = path.splitext(path.basename(input_filename))[0]
@@ -152,7 +141,6 @@ def make_output_filename(input_filename, args, video=False):
 
     return basename + metadata + auto_detect_suffix + (args.video_extension if video else get_image_ext(args.format))
 
-
 def make_video_codec_option(args):
     if args.video_codec in {"libx264", "libx265", "hevc_nvenc", "h264_nvenc"}:
         options = {"preset": args.preset, "crf": str(args.crf)}
@@ -169,9 +157,6 @@ def make_video_codec_option(args):
                 x265_params.append(f"level-idc={int(float(args.profile_level) * 10)}")
             options["x265-params"] = ":".join(x265_params)
         elif args.video_codec == "libx264":
-            # TODO:
-            # if args.tb or args.half_tb:
-            #    options["x264-params"] = "frame-packing=4"
             if args.half_sbs:
                 options["x264-params"] = "frame-packing=3"
         elif args.video_codec in {"hevc_nvenc", "h264_nvenc"}:
@@ -180,13 +165,11 @@ def make_video_codec_option(args):
             if torch.cuda.is_available() and args.gpu[0] >= 0:
                 options["gpu"] = str(args.gpu[0])
     elif args.video_codec == "libopenh264":
-        # NOTE: It seems libopenh264 does not support most options.
         options = {"b": args.video_bitrate}
     else:
         options = {}
 
     return options
-
 
 def get_image_ext(format):
     if format == "png":
@@ -197,7 +180,6 @@ def get_image_ext(format):
         return ".jpg"
     else:
         raise NotImplementedError(format)
-
 
 def save_image(im, output_filename, format="png", png_info=None):
     if format == "png":
@@ -221,7 +203,6 @@ def save_image(im, output_filename, format="png", png_info=None):
 
     im.save(output_filename, format=format, **options)
 
-
 def preprocess_image(x, args):
     if args.rotate_left:
         x = torch.rot90(x, 1, (-2, -1))
@@ -233,7 +214,6 @@ def preprocess_image(x, args):
     if args.max_output_height is not None and new_h > args.max_output_height:
         new_w = int(args.max_output_height / new_h * new_w)
         new_h = args.max_output_height
-        # only apply max height
     if new_w != w or new_h != h:
         new_h -= new_h % 2
         new_w -= new_w % 2
@@ -248,20 +228,19 @@ def preprocess_image(x, args):
 
     return x
 
-
 def apply_divergence(depth, im, args, side_model, reset_pts=None):
     batch = True
     if depth.ndim != 4:
-        # CHW
         depth = depth.unsqueeze(0)
         im = im.unsqueeze(0)
         batch = False
     else:
-        # BCHW
         pass
 
     if args.method in {"grid_sample", "backward"}:
+
         depth = get_mapper(args.mapper)(depth)
+        
         left_eye, right_eye = apply_divergence_grid_sample(
             im, depth,
             args.divergence, convergence=args.convergence,
@@ -269,6 +248,7 @@ def apply_divergence(depth, im, args, side_model, reset_pts=None):
         if not batch:
             left_eye = left_eye.squeeze(0)
             right_eye = right_eye.squeeze(0)
+
     elif args.method in {"forward", "forward_fill"}:
         depth = get_mapper(args.mapper)(depth)
         left_eye, right_eye = apply_divergence_forward_warp(
@@ -278,6 +258,7 @@ def apply_divergence(depth, im, args, side_model, reset_pts=None):
         if not batch:
             left_eye = left_eye.squeeze(0)
             right_eye = right_eye.squeeze(0)
+
     elif args.method in {"forward_inpaint", "mlbw_l2_inpaint"}:
         if args.method == "forward_inpaint":
             depth = get_mapper(args.mapper)(depth)
@@ -319,7 +300,7 @@ def apply_divergence(depth, im, args, side_model, reset_pts=None):
             left_eye = right_eye = None
     else:
         if args.stereo_width is not None:
-            # NOTE: use src aspect ratio instead of depth aspect ratio
+
             H, W = im.shape[2:]
             stereo_width = min(W, args.stereo_width)
             if depth.shape[3] != stereo_width:
@@ -328,10 +309,12 @@ def apply_divergence(depth, im, args, side_model, reset_pts=None):
                 depth = F.interpolate(depth, size=(new_h, new_w),
                                       mode="bilinear", align_corners=True, antialias=True)
                 depth = torch.clamp(depth, 0, 1)
+
+        depth = get_mapper(args.mapper)(depth)
+
         left_eye, right_eye = apply_divergence_nn_LR(
             side_model, im, depth,
             args.divergence, args.convergence, args.warp_steps,
-            mapper=args.mapper,
             synthetic_view=args.synthetic_view,
             preserve_screen_border=args.preserve_screen_border,
             enable_amp=not args.disable_amp,
@@ -341,7 +324,6 @@ def apply_divergence(depth, im, args, side_model, reset_pts=None):
             right_eye = right_eye.squeeze(0)
 
     return left_eye, right_eye
-
 
 def postprocess_padding(left_eye, right_eye, pad, pad_mode):
     assert pad_mode in {"tblr", "tb", "lr", "16:9", "top"}
@@ -358,8 +340,6 @@ def postprocess_padding(left_eye, right_eye, pad, pad_mode):
         left_eye = TF.pad(left_eye, (0, pad_top, 0, 0), padding_mode="constant")
         right_eye = TF.pad(right_eye, (0, pad_top, 0, 0), padding_mode="constant")
     elif pad_mode == "16:9":
-        # fit to 16:9
-        # pad size is ignored
         eps = 1e-3
         target_ratio = 16 / 9
         height, width = left_eye.shape[1:]
@@ -367,20 +347,16 @@ def postprocess_padding(left_eye, right_eye, pad, pad_mode):
         if abs(target_ratio - current_ratio) > eps:
             pad_h = pad_w = 0
             if current_ratio > target_ratio:
-                # pad top-bottom
                 target_height = round(width / target_ratio)
                 pad_h = (target_height - height) // 2
             else:
-                # pad left-right
                 target_width = round(height * target_ratio)
                 pad_w = (target_width - width) // 2
             left_eye = TF.pad(left_eye, (pad_w, pad_h, pad_w, pad_h), padding_mode="constant")
             right_eye = TF.pad(right_eye, (pad_w, pad_h, pad_w, pad_h), padding_mode="constant")
     return left_eye, right_eye
 
-
 def postprocess_image(left_eye, right_eye, args):
-    # CHW
     ipd_pad = int(abs(args.ipd_offset) * 0.01 * max(left_eye.shape[-2:]))
     ipd_pad -= ipd_pad % 2
     if ipd_pad > 0 and not (args.rgbd or args.half_rgbd):
@@ -405,18 +381,14 @@ def postprocess_image(left_eye, right_eye, args):
                               interpolation=InterpolationMode.BICUBIC, antialias=True)
 
     if args.anaglyph is not None:
-        # Anaglyph
         sbs = apply_anaglyph_redcyan(left_eye, right_eye, args.anaglyph)
     elif args.tb or args.half_tb:
-        # TopBottom
         sbs = torch.cat([left_eye, right_eye], dim=1)
         sbs = torch.clamp(sbs, 0., 1.)
     elif args.cross_eyed:
-        # Reverse SideBySide
         sbs = torch.cat([right_eye, left_eye], dim=2)
         sbs = torch.clamp(sbs, 0., 1.)
     else:
-        # SideBySide or RGBD
         sbs = torch.cat([left_eye, right_eye], dim=2)
         sbs = torch.clamp(sbs, 0., 1.)
 
@@ -438,21 +410,31 @@ def postprocess_image(left_eye, right_eye, args):
         sbs = torch.clamp(sbs, 0, 1)
     return sbs
 
-
-def debug_depth_image(depth, args):
+def dos_maps(depth, args):
     depth = depth.float()
-    mean_depth, std_depth = depth.mean().item(), depth.std().item()
     depth2 = get_mapper(args.mapper)(depth)
     out = torch.cat([depth, depth2], dim=2).cpu()
-    out = out.repeat((3, 1, 1))
-    # gc = ImageDraw.Draw(out)
-    # gc.text((16, 16), (f"min={round(float(depth_min), 4)}\n"
-    #                    f"max={round(float(depth_max), 4)}\n"
-    #                    f"mean={round(float(mean_depth), 4)}\n"
-    #                    f"std={round(float(std_depth), 4)}"), "gray")
-
+    # out = out.repeat((3, 1, 1))
     return out
 
+def depth_image(depth, sbs, args, side_model=None, depth_model=None, reset_pts=None):
+
+    # depth = dos_maps(depth, args)
+    d_np = depth.squeeze().cpu().numpy()
+    d_8bit = (d_np * 255).astype(np.uint8)
+
+    kernel = np.ones((5, 5), np.uint8)
+    dilated = cv2.dilate(d_8bit, kernel, iterations=4)
+
+    _, alpha_mask = cv2.threshold(dilated, 99, 255, cv2.THRESH_BINARY)
+    mask = torch.from_numpy(alpha_mask).unsqueeze(0).repeat(3, 1, 1).float() / 255.0
+    mask = torch.cat([mask, mask], dim=2)
+    
+    h, w = sbs.shape[-2:]
+    small_h, small_w = int(h * 0.1), int(w * 0.1)
+    small_out = F.interpolate(mask.unsqueeze(0), size=(small_h, small_w), mode="bilinear", align_corners=False).squeeze(0)
+    sbs[:, h - small_h:, w - small_w:] = small_out.to(sbs.device, sbs.dtype)
+    return sbs
 
 def process_image(x, args, depth_model, side_model, skip_autocrop=None, autocrop_uncrop=False):
     assert depth_model.get_ema_buffer_size() == 1
@@ -472,8 +454,13 @@ def process_image(x, args, depth_model, side_model, skip_autocrop=None, autocrop
         depth = depth_model.minmax_normalize_chw(depth)
 
         if args.debug_depth:
-            return debug_depth_image(depth, args)
-        elif args.rgbd or args.half_rgbd:
+            left_eye, right_eye = apply_divergence(depth, x, args, side_model)
+            left_eye = autocrop.uncrop(left_eye)
+            right_eye = autocrop.uncrop(right_eye)
+            sbs = postprocess_image(left_eye, right_eye, args)
+            return depth_image(depth, sbs, args)
+
+        if args.rgbd or args.half_rgbd:
             left_eye, right_eye = apply_rgbd(x, depth, mapper=args.mapper)
             left_eye = autocrop.uncrop(left_eye)
             right_eye = autocrop.uncrop(right_eye)
@@ -485,8 +472,6 @@ def process_image(x, args, depth_model, side_model, skip_autocrop=None, autocrop
                 if left_eye is not None:
                     break
             if left_eye.ndim == 4:
-                # NOTE: side_model is video inpaint model.
-                #       This may be called from test_callback.
                 left_eye = autocrop.uncrop(left_eye[0])
                 right_eye = autocrop.uncrop(right_eye[0])
                 sbs = postprocess_image(left_eye, right_eye, args)
@@ -494,11 +479,10 @@ def process_image(x, args, depth_model, side_model, skip_autocrop=None, autocrop
                 left_eye = autocrop.uncrop(left_eye)
                 right_eye = autocrop.uncrop(right_eye)
                 sbs = postprocess_image(left_eye, right_eye, args)
+
             return sbs
 
-
 def process_images(files, output_dir, args, depth_model, side_model, title=None):
-    # disable ema minmax for each process
     depth_model.disable_ema()
     if side_model is not None and hasattr(side_model, "set_mode"):
         side_model.set_mode("image")
@@ -507,7 +491,6 @@ def process_images(files, output_dir, args, depth_model, side_model, title=None)
     os.makedirs(output_dir, exist_ok=True)
 
     if args.resume:
-        # skip existing output files
         remaining_files = []
         existing_files = []
         for fn in files:
@@ -519,7 +502,6 @@ def process_images(files, output_dir, args, depth_model, side_model, title=None)
             else:
                 existing_files.append(fn)
         if existing_files:
-            # The last file may be corrupt, so process it again
             remaining_files.insert(0, existing_files[0])
         files = remaining_files
 
@@ -547,7 +529,6 @@ def process_images(files, output_dir, args, depth_model, side_model, title=None)
             output = process_image(im, args, depth_model, side_model)
             output = to_pil_image(output)
             f = pool.submit(save_image, output, output_filename, format=args.format)
-            #  f.result() # for debug
             futures.append(f)
             pbar.update(1)
             if suspend_event is not None:
@@ -562,9 +543,6 @@ def process_images(files, output_dir, args, depth_model, side_model, title=None)
             f.result()
     pbar.close()
 
-
-# video callbacks
-
 def bind_single_frame_callback(depth_model, side_model, segment_pts, args):
     src_queue = []
     frame_cpu_offload = depth_model.get_ema_buffer_size() > 1
@@ -574,10 +552,19 @@ def bind_single_frame_callback(depth_model, side_model, segment_pts, args):
         frames = []
         for depth in depths:
             x, pts = src_queue.pop(0)
+            reset_pts = [pts in segment_pts]
+
             if frame_cpu_offload:
                 x = x.to(args.state["device"]).permute(2, 0, 1) / torch.iinfo(x.dtype).max
+
             if args.debug_depth:
-                out = debug_depth_image(depth, args)
+                left_eye, right_eye = apply_divergence(depth, x, args, side_model, reset_pts=reset_pts)
+                if left_eye is not None:
+                    sbs = postprocess_image(left_eye, right_eye, args)
+                    out = depth_image(depth, sbs, args)
+                else:
+                    out = None
+
             elif args.rgbd or args.half_rgbd:
                 left_eye, right_eye = apply_rgbd(x, depth, mapper=args.mapper)
                 out = postprocess_image(left_eye, right_eye, args)
@@ -599,7 +586,6 @@ def bind_single_frame_callback(depth_model, side_model, segment_pts, args):
 
             if pts in segment_pts and args.debug_depth:
                 for o in out:
-                    # debug red line
                     o[0, 0:8, :] = 1.0
 
             for o in out:
@@ -617,14 +603,12 @@ def bind_single_frame_callback(depth_model, side_model, segment_pts, args):
     @torch.inference_mode()
     def _frame_callback(frame):
         if frame is None:
-            # flush
             return _postprocess(depth_model.flush_minmax_normalize(), flush=True)
 
         frame_hwc = torch.from_numpy(VU.to_ndarray(frame))
         pix_dtype, pix_max = frame_hwc.dtype, torch.iinfo(frame_hwc.dtype).max
 
         if frame_cpu_offload:
-            # cpu buffer
             if args.max_output_height is not None or args.rotate_right or args.rotate_left:
                 x = frame_hwc.to(args.state["device"]).permute(2, 0, 1) / pix_max
                 x = preprocess_image(x, args)
@@ -634,7 +618,6 @@ def bind_single_frame_callback(depth_model, side_model, segment_pts, args):
                 src_queue.append((frame_hwc, frame.pts))
                 x = frame_hwc.to(args.state["device"]).permute(2, 0, 1) / pix_max
         else:
-            # gpu buffer
             x = frame_hwc.to(args.state["device"]).permute(2, 0, 1) / pix_max
             x = preprocess_image(x, args)
             src_queue.append((x, frame.pts))
@@ -654,7 +637,6 @@ def bind_single_frame_callback(depth_model, side_model, segment_pts, args):
 
     return _frame_callback
 
-
 def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
     depth_lock = threading.RLock()
     sbs_lock = threading.RLock()
@@ -667,7 +649,6 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
 
     def _postprocess(depth_batch, reset_ema, dequeue_ticket_id, flush, device):
         src_depth_pairs = []
-        # Reorder threads
         with dequeue_ticket_lock(dequeue_ticket_id):
             with depth_lock:
                 if flush:
@@ -692,12 +673,11 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
             if frame_cpu_offload:
                 x_srcs = x_srcs.to(device).permute(0, 3, 1, 2) / torch.iinfo(x_srcs.dtype).max
 
-            with sbs_lock:  # TODO: unclear whether this is actually needed
+            with sbs_lock:
                 if args.rgbd or args.half_rgbd:
                     left_eyes, right_eyes = apply_rgbd(x_srcs, depths, mapper=args.mapper)
                 else:
                     if args.method in {"forward_fill", "forward"}:
-                        # lock all threads (sbs_lock -> ticket_lock -> depth_lock order)
                         with enqueue_ticket_lock, dequeue_ticket_lock, depth_lock:
                             left_eyes, right_eyes = apply_divergence(depths, x_srcs, args, side_model)
                     else:
@@ -710,7 +690,6 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
         return results
 
     def _batch_infer(x, pts, flush, enqueue_ticket_id):
-        # Reorder threads
         with enqueue_ticket_lock(enqueue_ticket_id):
             dequeue_ticket_id = dequeue_ticket_lock.new_ticket()
             if not flush:
@@ -773,7 +752,6 @@ def bind_batch_frame_callback(depth_model, side_model, segment_pts, args):
 
     return _cuda_stream_wrapper, _preprocess
 
-
 def bind_vda_frame_callback(depth_model, side_model, segment_pts, args):
     src_queue = []
     batch_queue = []
@@ -783,15 +761,29 @@ def bind_vda_frame_callback(depth_model, side_model, segment_pts, args):
 
     def _postprocess(depth_list, flush=False):
         results = []
+
         if args.debug_depth:
             for depth in depth_list:
-                out = debug_depth_image(depth, args)
-                _, pts = src_queue.pop(0)
-                if pts in segment_pts:
-                    out[0, 0:8, :] = 1.0
-                results.append(VU.to_frame(out, use_16bit=use_16bit))
+                x_cpu, pts = src_queue.pop(0)
+                x = x_cpu.to(args.state["device"]).permute(2, 0, 1).unsqueeze(0)
+                x = x / torch.iinfo(x_cpu.dtype).max
+                reset_pts = [pts in segment_pts]
+
+                left_eye, right_eye = apply_divergence(depth.unsqueeze(0), x, args, side_model, reset_pts=reset_pts)
+                if left_eye is not None:
+                    sbs = postprocess_image(left_eye.squeeze(0), right_eye.squeeze(0), args)
+                    out = depth_image(depth, sbs, args)
+                else:
+                    out = None
+
+                if out is not None:
+                    if pts in segment_pts:
+                        out[0, 0:8, :] = 1.0
+                    results.append(VU.to_frame(out, use_16bit=use_16bit))
+
         else:
             for depths in chunks(depth_list, args.batch_size):
+
                 depths = torch.stack(depths)
                 x_pts = [src_queue.pop(0) for _ in range(len(depths))]
                 reset_pts = [pts in segment_pts for _, pts in x_pts]
@@ -843,7 +835,6 @@ def bind_vda_frame_callback(depth_model, side_model, segment_pts, args):
     @torch.inference_mode()
     def frame_callback(frame):
         if frame is None:
-            # flush
             results = []
             if batch_queue:
                 results += _batch_infer()
@@ -866,13 +857,11 @@ def bind_vda_frame_callback(depth_model, side_model, segment_pts, args):
 
     return frame_callback
 
-
 def try_compile_context(side_model, enabled):
     if enabled and side_model is not None and hasattr(side_model, "compile_context"):
         return side_model.compile_context()
     else:
         return contextlib.nullcontext()
-
 
 def process_video_full(input_filename, output_path, args, depth_model, side_model):
     use_16bit = VU.pix_fmt_requires_16bit(args.pix_fmt)
@@ -975,7 +964,6 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
         x = VU.to_tensor(frame, device=args.state["device"])
         x = process_image(x, args, depth_model, side_model, skip_autocrop=True)
         if ema_normalize:
-            # reset ema to avoid affecting test frames
             depth_model.enable_ema(decay=decay, buffer_size=buffer_size)
         depth_model.reset()
         if side_model is not None and hasattr(side_model, "reset"):
@@ -1057,7 +1045,6 @@ def process_video_full(input_filename, output_path, args, depth_model, side_mode
         finally:
             frame_callback.shutdown()
 
-
 def process_video_keyframes(input_filename, output_path, args, depth_model, side_model):
     if is_output_dir(output_path):
         os.makedirs(output_path, exist_ok=True)
@@ -1093,9 +1080,7 @@ def process_video_keyframes(input_filename, output_path, args, depth_model, side
         for f in futures:
             f.result()
 
-
 def process_video(input_filename, output_path, args, depth_model, side_model):
-    # disable ema minmax for each process
     depth_model.reset()
     depth_model.disable_ema()
 
@@ -1103,7 +1088,6 @@ def process_video(input_filename, output_path, args, depth_model, side_model):
         process_video_keyframes(input_filename, output_path, args, depth_model, side_model)
     else:
         process_video_full(input_filename, output_path, args, depth_model, side_model)
-
 
 def export_images(input_path, output_dir, args, title=None):
     if path.isdir(input_path):
@@ -1115,7 +1099,6 @@ def export_images(input_path, output_dir, args, title=None):
         src_rgb_dir = path.normpath(path.abspath(path.dirname(input_path)))
 
     if not files:
-        # no image files
         return
 
     if args.export_disparity:
@@ -1160,7 +1143,6 @@ def export_images(input_path, output_dir, args, title=None):
     depth_model.disable_ema()
 
     if args.resume:
-        # skip existing depth files
         remaining_files = []
         existing_files = []
         for fn in files:
@@ -1172,7 +1154,6 @@ def export_images(input_path, output_dir, args, title=None):
                 existing_files.append(fn)
 
         if existing_files:
-            # The last file may be corrupt, so process it again
             remaining_files.insert(0, existing_files[0])
         files = remaining_files
 
@@ -1227,7 +1208,6 @@ def export_images(input_path, output_dir, args, title=None):
     pbar.close()
     config.save(config_file)
 
-
 def get_resume_seq(depth_dir, rgb_dir):
     last_seq = -1
     depth_files = sorted([path.basename(fn) for fn in ImageLoader.listdir(depth_dir)])
@@ -1240,10 +1220,6 @@ def get_resume_seq(depth_dir, rgb_dir):
             last_seq = int(path.splitext(depth_files[-1])[0], 10)
 
     return last_seq
-
-
-# export callbacks
-
 
 def bind_export_single_frame_callback(depth_model, segment_pts, rgb_dir, depth_dir, pool, args):
     src_queue = []
@@ -1282,7 +1258,6 @@ def bind_export_single_frame_callback(depth_model, segment_pts, rgb_dir, depth_d
     @torch.inference_mode()
     def _frame_callback(frame):
         if frame is None:
-            # flush
             return _postprocess(depth_model.flush_minmax_normalize())
 
         frame_np = frame.to_ndarray(format="rgb24")
@@ -1303,7 +1278,6 @@ def bind_export_single_frame_callback(depth_model, segment_pts, rgb_dir, depth_d
         return _postprocess(depths)
 
     return _frame_callback
-
 
 def bind_export_vda_frame_callback(depth_model, segment_pts, rgb_dir, depth_dir, pool, args):
     src_queue = []
@@ -1368,7 +1342,6 @@ def bind_export_vda_frame_callback(depth_model, segment_pts, rgb_dir, depth_dir,
     @torch.inference_mode()
     def frame_callback(frame):
         if frame is None:
-            # flush
             if batch_queue:
                 _batch_infer()
             depth_list = depth_model.flush_with_normalize(
@@ -1385,7 +1358,6 @@ def bind_export_vda_frame_callback(depth_model, segment_pts, rgb_dir, depth_dir,
                 _batch_infer()
 
     return frame_callback
-
 
 def export_video(input_filename, output_dir, args, title=None):
     basename = path.splitext(path.basename(input_filename))[0]
@@ -1420,7 +1392,6 @@ def export_video(input_filename, output_dir, args, title=None):
             }
         }
     )
-    # NOTE: Windows does not allow creating folders with trailing spaces. basename.strip()
     output_dir = path.join(output_dir, basename.strip())
     rgb_dir = path.join(output_dir, config.rgb_dir)
     depth_dir = path.join(output_dir, config.depth_dir)
@@ -1485,7 +1456,7 @@ def export_video(input_filename, output_dir, args, title=None):
         fps = VU.get_fps(stream)
         if float(fps) > args.max_fps:
             fps = args.max_fps
-        config.fps = fps  # update fps
+        config.fps = fps
 
         def state_update_callback(c):
             config.source_color_range = c.state["source_color_range"]
@@ -1538,7 +1509,6 @@ def export_video(input_filename, output_dir, args, title=None):
                           end_time=args.end_time)
         config.save(config_file)
 
-
 def process_config_video(config, args, side_model):
     use_16bit = VU.pix_fmt_requires_16bit(args.pix_fmt)
     base_dir = path.dirname(args.input)
@@ -1583,7 +1553,6 @@ def process_config_video(config, args, side_model):
     @torch.inference_mode()
     def batch_callback(x, depths, test=False):
         if not config.skip_edge_dilation and edge_dilation_is_enabled(args.edge_dilation):
-            # apply --edge-dilation
             depths = -dilate_edge(-depths, args.edge_dilation)
         with sbs_lock:
             if test:
@@ -1641,7 +1610,7 @@ def process_config_video(config, args, side_model):
         side_model.reset()
 
     video_config = VU.VideoOutputConfig(
-        fps=config.fps,  # use config.fps, ignore args.max_fps
+        fps=config.fps,
         container_format=args.video_format,
         video_codec=args.video_codec,
         pix_fmt=args.pix_fmt,
@@ -1657,16 +1626,11 @@ def process_config_video(config, args, side_model):
     original_mapper = args.mapper
     try:
         if config.skip_mapper:
-            # force use "none" mapper
             args.mapper = "none"
         else:
             if config.mapper is not None:
-                # use specified mapper from config
-                # NOTE: override args
                 args.mapper = config.mapper
             else:
-                # when config.mapper is not defined, use args.mapper
-                # TODO: It can be still disputable
                 pass
         VU.generate_video(
             output_filename,
@@ -1681,7 +1645,6 @@ def process_config_video(config, args, side_model):
         )
     finally:
         args.mapper = original_mapper
-
 
 def process_config_images(config, args, side_model):
     base_dir = path.dirname(args.input)
@@ -1704,7 +1667,6 @@ def process_config_images(config, args, side_model):
     depth_files = ImageLoader.listdir(depth_dir)
 
     if args.resume:
-        # skip existing output files
         remaining_files = []
         existing_files = []
         for fn in rgb_files:
@@ -1716,7 +1678,6 @@ def process_config_images(config, args, side_model):
             else:
                 existing_files.append(fn)
         if existing_files:
-            # The last file may be corrupt, so process it again
             remaining_files.insert(0, existing_files[0])
         rgb_files = remaining_files
 
@@ -1783,7 +1744,6 @@ def process_config_images(config, args, side_model):
             pbar.close()
     finally:
         args.mapper = original_mapper
-
 
 def create_parser(required_true=True):
     class Range(object):
@@ -1997,21 +1957,18 @@ def create_parser(required_true=True):
                         choices=["divergence", "convergence", "foreground-scale", "ipd-offset"],
                         help="outputs results for various parameter combinations")
 
-    # TODO: Change the default value from "unspecified" to "auto"
     parser.add_argument("--colorspace", type=str, default="unspecified",
                         choices=["unspecified", "auto",
                                  "bt709", "bt709-pc", "bt709-tv",
                                  "bt601", "bt601-pc", "bt601-tv",
                                  "bt2020-tv", "bt2020-pq-tv"],
                         help="video colorspace")
-    # Deprecated
     parser.add_argument("--zoed-batch-size", type=int,
                         help="Deprecated. Use --batch-size instead")
     parser.add_argument("--zoed-height", type=int,
                         help="Deprecated. Use --resolution instead")
 
     return parser
-
 
 def calc_auto_warp_steps(method, divergence, synthetic_view):
     divergence = divergence if synthetic_view == "both" else divergence * 2
@@ -2021,7 +1978,6 @@ def calc_auto_warp_steps(method, divergence, synthetic_view):
         return math.ceil(divergence / ROW_FLOW_V3_AUTO_STEP_DIVERGENCE)
 
     return None
-
 
 def set_state_args(args, stop_event=None, tqdm_fn=None, depth_model=None, suspend_event=None):
     if depth_model is None:
@@ -2041,7 +1997,6 @@ def set_state_args(args, stop_event=None, tqdm_fn=None, depth_model=None, suspen
             warnings.warn("--scene-detect is highly recommended for VideoDepthAnything")
 
     if is_video(args.output):
-        # replace --video-format when filename is specified
         ext = path.splitext(args.output)[-1]
         if ext == ".mp4":
             args.video_format = "mp4"
@@ -2057,7 +2012,6 @@ def set_state_args(args, stop_event=None, tqdm_fn=None, depth_model=None, suspen
     if not args.profile_level or args.profile_level == "auto":
         args.profile_level = None
 
-    # deprecated options
     if args.zoed_batch_size is not None:
         args.batch_size = args.zoed_batch_size
         warnings.warn("--zoed-batch-size is deprecated. Use --batch-size instead")
@@ -2079,7 +2033,6 @@ def set_state_args(args, stop_event=None, tqdm_fn=None, depth_model=None, suspen
     gc_collect()
 
     return args
-
 
 def export_main(args):
     if is_text(args.input):
@@ -2129,17 +2082,14 @@ def export_main(args):
     else:
         raise ValueError("Unrecognized file type")
 
-
 def is_yaml(filename):
     return path.splitext(filename)[-1].lower() in {".yaml", ".yml"}
-
 
 def iw3_main(args):
     assert not (args.rotate_left and args.rotate_right)
     assert sum([1 for flag in (args.half_sbs, args.vr180, args.anaglyph, args.tb, args.half_tb, args.cross_eyed, args.half_rgbd, args.rgbd) if flag]) < 2
 
     if len(args.gpu) > 1 and len(args.gpu) > args.max_workers:
-        # For GPU round-robin on thread pool
         args.max_workers = len(args.gpu)
 
     if args.warp_steps is None:
@@ -2175,7 +2125,6 @@ def iw3_main(args):
                                           mapper_type=args.mapper_type)
     else:
         depth_model = None
-        # specified args.mapper never used in process_config_*
         args.mapper = "none"
 
     if args.export:
@@ -2256,6 +2205,7 @@ def iw3_main(args):
         if not depth_model.is_video_supported():
             raise ValueError(f"{args.depth_model} does not support video input")
         process_video(args.input, args.output, args, depth_model, side_model)
+
     elif is_image(args.input):
         if not depth_model.is_image_supported():
             raise ValueError(f"{args.depth_model} does not support image input")
@@ -2280,7 +2230,6 @@ def iw3_main(args):
         raise ValueError("Unrecognized file type")
 
     return args
-
 
 def find_param(args, depth_model, side_model):
     im, _ = load_image_simple(args.input, color="rgb")
